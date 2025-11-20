@@ -1,371 +1,328 @@
-# file: agents/news.py
+# agents/ingest_agent.py
 """
-NewsAgent - compact JSON output (news_items only) with ticker + sector inference.
-
-Run: python agents/news.py
+Integrated Ingest Agent with portfolio processing and UI.
+Combines IngestAgent, parser, models, and file handling.
+Supports both file upload and manual data entry.
 """
-from __future__ import annotations
 
-import html
-import hashlib
 import json
-import re
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Any, Tuple, Iterable
-from urllib.parse import quote_plus
-from urllib.request import urlopen, Request
-import xml.etree.ElementTree as ET
+from typing import Union, Optional, Literal, List, Dict, Any
 from pathlib import Path
+import sys
 
-# ---------- Data model ----------
-@dataclass
-class NewsItem:
-    id: str
-    headline: str
-    snippet: Optional[str]
-    url: Optional[str]
-    source: Optional[str]
-    published_at: Optional[str]  # iso string
-    text: Optional[str]
-    tickers: List[str]
-    sectors: List[str]
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+from ingest.parser import parse_file, to_canonical_json, row_to_portfolio_row_from_mapped
+from ingest.models import PortfolioJSON, ValidationReport, PortfolioRow
+from ingest.symbol_mapper import normalize_ticker
+from ingest.sector_mapper import assign_sector
 
 
-# ---------- Agent ----------
-class NewsAgent:
-    def __init__(self):
-        # defaults tuned for simple runs
-        self.user_agent = "NewsAgent/1.0"
+def open_file_browser() -> Optional[Path]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError:
+        print("⚠ GUI file browser not available (tkinter not installed)")
+        return None
 
-    # ----- fetchers -----
-    def _fetch_rss(self, url: str, source_name: str, max_items: int = 10) -> List[Dict[str, Any]]:
-        try:
-            req = Request(url, headers={"User-Agent": self.user_agent})
-            with urlopen(req, timeout=15) as resp:
-                raw = resp.read()
-            root = ET.fromstring(raw)
-            items = []
-            for item in root.findall('.//item')[:max_items]:
-                title = item.findtext('title') or ''
-                link = item.findtext('link') or ''
-                desc = item.findtext('description') or item.findtext('summary') or ''
-                pub = item.findtext('pubDate') or item.findtext('published') or item.findtext('dc:date') or None
-                items.append({'title': title, 'link': link, 'description': desc, 'pubDate': pub, 'source': source_name})
-            return items
-        except Exception:
-            return []
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        file_path = filedialog.askopenfilename(
+            title="Select Portfolio File (CSV/Excel)",
+            filetypes=[('All Supported', '*.csv *.xlsx *.xls'), ('CSV files','*.csv'), ('Excel files','*.xlsx *.xls'), ('All files','*.*')]
+        )
+        root.destroy()
+        if file_path:
+            return Path(file_path)
+        return None
+    except Exception as e:
+        print(f"⚠ Error opening file browser: {e}")
+        return None
 
-    def fetch_google_news_rss(self, query: str, max_items: int = 10) -> List[Dict[str, Any]]:
-        url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
-        return self._fetch_rss(url, 'google_news_rss', max_items=max_items)
 
-    def fetch_indian_rss_sources(self, max_items_per_feed: int = 8) -> List[Dict[str, Any]]:
-        feeds = {
-            'moneycontrol_latest': 'https://www.moneycontrol.com/rss/latestnews.xml',
-            'moneycontrol_top': 'https://www.moneycontrol.com/rss/MCtopnews.xml',
-            'economictimes_markets': 'https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms',
-            'livemint_markets': 'https://www.livemint.com/rss/markets',
-            'businessstandard_markets': 'https://www.business-standard.com/rss/markets-106.rss',
-            'cnbctv18_business': 'https://www.cnbctv18.com/rss/business.xml',
-            'hindu_businessline': 'https://www.thehindubusinessline.com/markets/feeder/default.rss'
-        }
-        items: List[Dict[str, Any]] = []
-        for name, url in feeds.items():
-            items += self._fetch_rss(url, name, max_items=max_items_per_feed)
-        return items
+def manual_data_entry(agent: 'IngestAgent') -> PortfolioJSON:
+    print("\n" + "=" * 60)
+    print("Manual Data Entry")
+    print("=" * 60)
+    print("Enter portfolio holdings one by one.")
+    print("Press Enter on an empty ticker to finish.\n")
 
-    # ----- normalization -----
-    def _strip_html(self, s: Optional[str]) -> Optional[str]:
-        if not s:
-            return s
-        s = html.unescape(s)
-        s = re.sub(r'<[^>]+>', ' ', s)
-        s = re.sub(r'\s+', ' ', s).strip()
-        return s
+    portfolio_rows: List[PortfolioRow] = []
+    entry_num = 1
+    while True:
+        print(f"\n--- Holding #{entry_num} ---")
+        ticker = input("Ticker/Symbol (required): ").strip()
+        if not ticker:
+            print("Finishing data entry...")
+            break
+        qty_str = input("Quantity/Shares (optional, press Enter to skip): ").strip()
+        cost_str = input("Cost per share/Price (optional, press Enter to skip): ").strip()
+        value_str = input("Total holding value (optional, press Enter to skip): ").strip()
+        sector = input("Sector/Industry (optional, press Enter to skip): ").strip()
+        notes = input("Notes (optional, press Enter to skip): ").strip()
 
-    def _parse_pubdate(self, pub: Optional[str]) -> Optional[datetime]:
-        if not pub:
-            return None
-        try:
-            # iso if possible
-            return datetime.fromisoformat(pub.replace('Z', '+00:00'))
-        except Exception:
+        def parse_num(s):
+            if not s:
+                return None
             try:
-                from email.utils import parsedate_to_datetime
-                return parsedate_to_datetime(pub)
+                s_clean = s.replace(',', '').replace('$','').replace('₹','').strip()
+                return float(s_clean) if s_clean else None
             except Exception:
-                try:
-                    return datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %Z")
-                except Exception:
-                    return None
+                return None
 
-    def normalize(self, raw: Dict[str, Any]) -> Dict[str, Any]:
-        title = (raw.get('title') or '').strip()
-        snippet = self._strip_html(raw.get('description') or '')
-        url = raw.get('link') or raw.get('url') or None
-        source = raw.get('source') or None
-        pub = raw.get('pubDate') or raw.get('publishedAt') or None
-        dt = self._parse_pubdate(pub)
-        if isinstance(dt, datetime):
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            else:
-                dt = dt.astimezone(timezone.utc)
-            published_iso = dt.isoformat()
+        qty = parse_num(qty_str)
+        cost = parse_num(cost_str)
+        value = parse_num(value_str)
+
+        if agent.use_symbol_mapping:
+            normalized_ticker, _ = normalize_ticker(ticker)
+            ticker = normalized_ticker if normalized_ticker else ticker.upper()
         else:
-            published_iso = None
-        text = ' '.join(filter(None, [title, snippet]))[:20000] if title or snippet else None
-        return {'headline': title, 'snippet': snippet, 'url': url, 'source': source, 'published_at': published_iso, 'text': text}
+            ticker = ticker.upper()
 
-    # ----- dedupe -----
-    def fingerprint(self, headline: str, url: Optional[str]) -> str:
-        key = (headline or '').strip().lower() + '||' + (url or '')
-        return hashlib.sha256(key.encode('utf-8')).hexdigest()
-
-    def dedupe(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        seen = set()
-        out = []
-        for it in items:
-            fp = self.fingerprint(it.get('headline',''), it.get('url'))
-            if fp in seen:
-                continue
-            seen.add(fp)
-            it['id'] = fp
-            out.append(it)
-        return out
-
-    # ----- alias generator & entity linking -----
-    def _generate_aliases(self, tickers: List[str]) -> Dict[str, List[str]]:
-        out = {}
-        for tk in tickers:
-            if not tk:
-                continue
-            k = tk.strip().upper()
-            base = k.split('.')[0]
-            # heuristics: make spaced name variants
-            spaced = re.sub(r'[_\-.]+', ' ', base)
-            spaced = re.sub(r'(?<=[a-zA-Z])(?=[A-Z][a-z])', ' ', spaced)
-            spaced = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', spaced)
-            spaced = spaced.strip()
-            forms = set()
-            if spaced:
-                forms.add(spaced.upper())
-                forms.add(spaced.title())
-                forms.add(re.sub(r'\s+', '', spaced).upper())
-            tokens = re.split(r'\s+', spaced.upper()) if spaced else [base]
-            if tokens:
-                forms.add(tokens[0])
-            cleaned = [f for f in forms if len(re.sub(r'[^A-Za-z]', '', f)) >= 2 and not re.search(r'^\d+$', f)]
-            if cleaned:
-                out[k] = cleaned
-        return out
-
-    def link_entities(self, text: str, tickers: List[str], ticker_to_names: Dict[str, List[str]]) -> Tuple[List[str], List[str]]:
-        text_l = (text or '').lower()
-        found = set()
-        for t in tickers:
-            if not t:
-                continue
-            t_up = t.strip().upper()
-            # direct ticker match ($ or bare)
-            if re.search(rf"(\${re.escape(t_up)}|\b{re.escape(t_up)}\b)", text, flags=re.IGNORECASE):
-                found.add(t_up)
-                continue
-            # match aliases
-            aliases = ticker_to_names.get(t_up, [])
-            for a in aliases:
-                a_norm = a.lower().strip()
-                if not a_norm:
-                    continue
-                # word boundary match or contiguous letters match
-                if a_norm in text_l or re.search(rf"\b{re.escape(a_norm)}\b", text_l, flags=re.IGNORECASE):
-                    found.add(t_up)
-                    break
-        # sectors handled separately
-        return sorted(found)
-
-    # ----- simple sector inference -----
-    def infer_sectors(self, tickers: List[str]) -> List[str]:
-        sectors = set()
-        for t in tickers:
-            tu = t.upper()
-            if 'BANK' in tu or tu.endswith('BANK') or tu.endswith('BANK.NS'):
-                sectors.add('financials')
-            elif 'PHARMA' in tu or 'DRUG' in tu or 'CHEM' in tu:
-                sectors.add('healthcare')
-            elif any(x in tu for x in ['INFY','TCS','WIPRO','HCL','TECH','IT']):
-                sectors.add('information_technology')
-            elif any(x in tu for x in ['RELIANCE','ONGC','OIL','POWER','ENERGY','PETRO']):
-                sectors.add('energy')
-            elif any(x in tu for x in ['TITAN','MOTORS','MARUTI','TATA','MAHINDRA','EICHER','BAJAJ']):
-                sectors.add('consumer_discretionary')
-            elif any(x in tu for x in ['ITC','HINDUNILVR','NESTLE','DABUR','BRITANNIA']):
-                sectors.add('consumer_staples')
-            elif any(x in tu for x in ['COAL','CEMENT','ULTRACEM','LARSEN']):
-                sectors.add('materials')
-            else:
-                sectors.add('other')
-        return sorted(sectors)
-
-    # ----- run -----
-    def run(self, tickers: List[str], sectors_input: List[str], window_hours: int = 168, max_per_ticker: int = 10, include_indian_rss: bool = True, require_ticker_mention: bool = False, ticker_to_names: Optional[Dict[str, List[str]]] = None) -> Dict[str, Any]:
-        window_cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
-        raw_items: List[Dict[str, Any]] = []
-
-        queries = [t.upper() for t in tickers if t]
-        if not queries:
-            queries = [s for s in sectors_input if s]
-        if not queries:
-            queries = ['market', 'stocks', 'industry']
-
-        # fetch per query
-        for q in queries:
-            raw_items += self.fetch_google_news_rss(q, max_items=max_per_ticker)
-
-        if include_indian_rss:
-            raw_items += self.fetch_indian_rss_sources(max_items_per_feed=min(6, max_per_ticker))
-
-        # normalize
-        normalized = [self.normalize(r) for r in raw_items]
-
-        # time filter: keep if published within window or unknown (to maximize recall)
-        def within_window(it: Dict[str, Any]) -> bool:
-            pa = it.get('published_at')
-            if pa:
-                try:
-                    dt = datetime.fromisoformat(pa)
-                    return dt >= window_cutoff
-                except Exception:
-                    return True
-            return True
-
-        normalized = [n for n in normalized if within_window(n)]
-
-        # dedupe
-        unique = self.dedupe(normalized)
-
-        # prepare alias map
-        alias_map = dict(ticker_to_names or {})
-        generated = self._generate_aliases(tickers)
-        for k, v in generated.items():
-            if k not in alias_map or not alias_map.get(k):
-                alias_map[k] = v
-
-        # entity linking + assemble output items
-        out_items: List[NewsItem] = []
-        for u in unique:
-            text = u.get('text') or ''
-            matched_tickers = self.link_entities(text, tickers, alias_map)
-            # when strict require_ticker_mention is True, skip if no match
-            if require_ticker_mention and not matched_tickers:
-                continue
-            sectors_assigned = self.infer_sectors(matched_tickers) if matched_tickers else []
-            # build minimal item as per user requirement
-            ni = NewsItem(
-                id = u.get('id'),
-                headline = u.get('headline') or '',
-                snippet = u.get('snippet') or '',
-                url = u.get('url'),
-                source = u.get('source'),
-                published_at = u.get('published_at'),
-                text = (u.get('text') or '')[:20000],
-                tickers = matched_tickers,
-                sectors = sectors_assigned
-            )
-            out_items.append(ni)
-
-        # final output: only news_items list (compact)
-        return {'news_items': [n.to_dict() for n in out_items]}
-
-
-# ---------- Helpers to load portfolio ----------
-def _load_tickers_from_portfolio_file(portfolio_path: Optional[str]) -> List[str]:
-    if not portfolio_path:
-        return []
-    try:
-        import importlib
-        pd = importlib.import_module("pandas")
-    except Exception:
-        return []
-    path = Path(portfolio_path).expanduser()
-    if not path.exists():
-        return []
-    try:
-        if path.suffix.lower() in {'.xlsx', '.xls'}:
-            df = pd.read_excel(path)
+        if agent.use_sector_mapping:
+            final_sector = assign_sector(ticker, sector if sector else None)
         else:
-            df = pd.read_csv(path)
-    except Exception:
+            final_sector = sector if sector else None
+
+        try:
+            row = PortfolioRow.model_validate({
+                'ticker': ticker,
+                'qty': qty,
+                'value': value,
+                'sector': final_sector,
+                'cost': cost,
+                'notes': notes if notes else None
+            })
+            portfolio_rows.append(row)
+            print(f"✓ Added {ticker}")
+            entry_num += 1
+        except Exception as e:
+            print(f"✗ Error adding holding: {e}")
+            continue
+
+    portfolio_json = to_canonical_json(portfolio_rows)
+    validation_report = ValidationReport(
+        unresolved_tickers=[],
+        missing_sectors=[r.ticker for r in portfolio_rows if not r.sector or r.sector=='unknown'],
+        parse_errors=[],
+        total_rows=len(portfolio_rows),
+        valid_rows=len(portfolio_rows)
+    )
+    return PortfolioJSON(portfolio=portfolio_json, validation_report=validation_report, user_id=agent.user_id)
+
+
+def process_file_upload(agent: 'IngestAgent', file_path: Path) -> PortfolioJSON:
+    print(f"Loading file: {file_path}")
+    print(f"Retention mode: {agent.retention_mode}")
+    print(f"User ID: {agent.user_id}\n")
+    try:
+        portfolio_json = agent.process_portfolio(file_path)
+        print(f"✓ Processed portfolio successfully\n")
+        return portfolio_json
+    except FileNotFoundError:
+        print(f"✗ Error: File not found: {file_path}")
+        raise
+    except Exception as e:
+        print(f"✗ Error processing file: {e}")
+        raise
+
+
+def display_results(portfolio_json: PortfolioJSON, agent: 'IngestAgent'):
+    print("=" * 60)
+    print("Portfolio JSON Output")
+    print("=" * 60)
+    print(json.dumps(portfolio_json.portfolio, indent=2, default=str))
+    print("\n" + "=" * 60)
+    print("Validation Report")
+    print("=" * 60)
+    report = portfolio_json.validation_report
+    print(f"Total rows: {report.total_rows}")
+    print(f"Valid rows: {report.valid_rows}")
+    if report.unresolved_tickers:
+        print(f"Unresolved tickers ({len(report.unresolved_tickers)}): {report.unresolved_tickers}")
+    if report.missing_sectors:
+        print(f"Missing sectors ({len(report.missing_sectors)}): {report.missing_sectors[:10]}...")
+    if report.parse_errors:
+        print(f"Parse errors ({len(report.parse_errors)}):")
+        for error in report.parse_errors[:5]:
+            print(f"  - {error}")
+    print("\n" + "=" * 60)
+    print("Summary")
+    print("=" * 60)
+    print(f"Total holdings: {len(portfolio_json.portfolio)}")
+    total_value = sum(item.get('holding_value',0) or 0 for item in portfolio_json.portfolio if item.get('holding_value'))
+    print(f"Total portfolio value: ${total_value:,.2f}")
+    computed_count = sum(1 for item in portfolio_json.portfolio if item.get('holding_value') is not None)
+    print(f"Holdings with computed values: {computed_count}/{len(portfolio_json.portfolio)}")
+    file_to_delete = agent.get_file_deletion_instruction()
+    if file_to_delete:
+        print(f"\n⚠ Ephemeral mode: File marked for deletion: {file_to_delete}")
+        print("   (In production, Orchestrator would delete this file after processing)")
+
+
+class IngestAgent:
+    def __init__(self, retention_mode: Literal['persistent','ephemeral']='persistent', user_id: Optional[str]=None, use_symbol_mapping: bool=True, use_sector_mapping: bool=True):
+        self.retention_mode = retention_mode
+        self.user_id = None if retention_mode == 'ephemeral' else user_id
+        self.use_symbol_mapping = use_symbol_mapping
+        self.use_sector_mapping = use_sector_mapping
+        self.file_to_delete = None
+
+    def load_file(self, file_path: Union[str,Path]):
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        import pandas as pd
+        if file_path.suffix.lower() == '.csv':
+            df = pd.read_csv(file_path)
+        elif file_path.suffix.lower() in ['.xlsx','.xls']:
+            df = pd.read_excel(file_path)
+        else:
+            raise ValueError('Unsupported file format. Use CSV or Excel.')
+        return df.to_dict(orient='records')
+
+    def process_portfolio(self, file_path: Union[str,Path]) -> PortfolioJSON:
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        if self.retention_mode == 'ephemeral':
+            self.file_to_delete = file_path
+        try:
+            portfolio_rows, column_mapping, parse_errors_from_file = parse_file(str(file_path), use_symbol_mapping=self.use_symbol_mapping, use_sector_mapping=self.use_sector_mapping)
+        except Exception as e:
+            return PortfolioJSON(portfolio=[], validation_report=ValidationReport(parse_errors=[f"File parsing failed: {str(e)}"], total_rows=0, valid_rows=0), user_id=self.user_id)
+        unresolved_tickers = []
+        missing_sectors = []
+        parse_errors = parse_errors_from_file.copy()
+        valid_rows = 0
+        tickers_seen = set()
+        for row in portfolio_rows:
+            if self.use_symbol_mapping:
+                normalized, error = normalize_ticker(row.ticker)
+                if error:
+                    if row.ticker not in tickers_seen:
+                        unresolved_tickers.append(row.ticker)
+                        tickers_seen.add(row.ticker)
+                elif not normalized or len(row.ticker) < 1:
+                    if row.ticker not in tickers_seen:
+                        unresolved_tickers.append(row.ticker)
+                        tickers_seen.add(row.ticker)
+            if not row.sector or row.sector == 'unknown':
+                missing_sectors.append(row.ticker)
+            if 'PARSE_ERROR' in (row.notes or ''):
+                parse_errors.append(f"Ticker {row.ticker}: {row.notes}")
+            if row.ticker and len(row.ticker) > 0:
+                valid_rows += 1
+        portfolio_json = to_canonical_json(portfolio_rows)
+        validation_report = ValidationReport(unresolved_tickers=unresolved_tickers, missing_sectors=missing_sectors, parse_errors=parse_errors, total_rows=len(portfolio_rows), valid_rows=valid_rows)
+        return PortfolioJSON(portfolio=portfolio_json, validation_report=validation_report, user_id=self.user_id)
+
+    def get_file_deletion_instruction(self) -> Optional[Path]:
+        return self.file_to_delete
+
+
+def extract_tickers_from_portfolio(file_path):
+    from pathlib import Path
+    file_path = Path(file_path)
+    import pandas as pd
+    if not file_path.exists():
+        print(f"File not found: {file_path}")
+        return []
+    if file_path.suffix.lower() == '.csv':
+        df = pd.read_csv(file_path)
+    elif file_path.suffix.lower() in ['.xlsx','.xls']:
+        df = pd.read_excel(file_path)
+    else:
+        print('Unsupported file format. Use CSV or Excel.')
         return []
     ticker_col = None
     for col in df.columns:
-        if isinstance(col, str) and col.strip().lower() in {'ticker', 'symbol'}:
+        if col.lower() in ['ticker','symbol']:
             ticker_col = col
             break
-    tickers = []
     if ticker_col:
-        tickers = df[ticker_col].dropna().astype(str).str.strip().tolist()
+        tickers = df[ticker_col].dropna().unique().tolist()
+        print('Tickers found in portfolio file:')
+        for t in tickers:
+            print(t)
+        return tickers
     else:
-        # fallback: take first column if it's a simple sample
-        try:
-            first_col = df.iloc[:,0].dropna().astype(str).str.strip().tolist()
-            tickers = first_col
-        except Exception:
-            tickers = []
-    normalized = []
-    seen = set()
-    for t in tickers:
-        k = t.strip().upper()
-        if k and k not in seen:
-            seen.add(k)
-            normalized.append(k)
-    return normalized
+        print('No ticker column found in the file. Columns available:', df.columns.tolist())
+        return []
 
 
-# ---------- CLI ----------
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--portfolio-file', help='Optional portfolio file path', default=None)
-    parser.add_argument('--hours', '-w', type=int, default=168)
-    parser.add_argument('--max', '-m', type=int, default=10)
-    parser.add_argument('--no-indian-rss', dest='include_indian_rss', action='store_false')
-    parser.set_defaults(include_indian_rss=True)
-    args = parser.parse_args()
-
-    # auto-discover portfolio file if not provided
-    portfolio_file = args.portfolio_file
-    if not portfolio_file:
-        project_root = Path(__file__).parent.parent
-        candidates = [
-            Path("/home/sahildogra/Desktop/ingest_agent/data/samples/large_portfolio.xlsx"),
-            Path("/mnt/data/large_portfolio.xlsx"),
-            project_root / "data" / "samples" / "large_portfolio.xlsx",
-            project_root / "data" / "samples" / "complex_portfolio.xlsx",
-        ]
-        for c in candidates:
-            if c.exists():
-                portfolio_file = str(c)
-                break
-
-    tickers = _load_tickers_from_portfolio_file(portfolio_file)
-    if not tickers:
-        # fallback default tickers
-        tickers = ['RELIANCE.NS', 'TCS.NS']
-
-    agent = NewsAgent()
-    out = agent.run(
-        tickers = tickers,
-        sectors_input = [],
-        window_hours = args.hours,
-        max_per_ticker = args.max,
-        include_indian_rss = args.include_indian_rss,
-        require_ticker_mention = False
-    )
-
-    # Print only the compact news_items JSON (user requested format)
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    import sys
+    if len(sys.argv) > 1:
+        extract_tickers_from_portfolio(sys.argv[1])
+    else:
+        script_dir = Path(__file__).parent
+        project_root = script_dir.parent
+        agent = IngestAgent(retention_mode='persistent', user_id='user123', use_symbol_mapping=True, use_sector_mapping=True)
+        print('='*60)
+        print('Portfolio Ingest Agent')
+        print('='*60)
+        print('\nChoose an option:')
+        print('1. Upload file (CSV/Excel)')
+        print('2. Manual data entry')
+        print()
+        choice = input('Enter choice (1 or 2): ').strip()
+        try:
+            if choice == '1':
+                file_path_input = input("\nEnter file path (or 'browser' for GUI): ").strip()
+                if file_path_input.lower() in ('browser','b'):
+                    file_path = open_file_browser() or (project_root / 'data' / 'samples' / 'complex_portfolio.xlsx')
+                elif file_path_input:
+                    candidate = Path(file_path_input.strip('\'\"')).expanduser()
+                    if not candidate.is_absolute():
+                        candidate = candidate.resolve()
+                    if candidate.is_dir():
+                        csv_files = list(candidate.glob('*.csv'))
+                        xls_files = list(candidate.glob('*.xlsx')) + list(candidate.glob('*.xls'))
+                        all_files = sorted(csv_files + xls_files)
+                        if all_files:
+                            print('Found the following portfolio files:')
+                            for idx,f in enumerate(all_files,1):
+                                print(f'  {idx}. {f.name}')
+                            sel = input('Enter file number (or press Enter for default): ').strip()
+                            try:
+                                sel_idx = int(sel)-1
+                                if 0 <= sel_idx < len(all_files):
+                                    file_path = all_files[sel_idx]
+                                else:
+                                    file_path = project_root / 'data' / 'samples' / 'complex_portfolio.xlsx'
+                            except Exception:
+                                file_path = project_root / 'data' / 'samples' / 'complex_portfolio.xlsx'
+                        else:
+                            print('No CSV/Excel files found in directory; using default sample file.')
+                            file_path = project_root / 'data' / 'samples' / 'complex_portfolio.xlsx'
+                    else:
+                        file_path = candidate
+                else:
+                    file_path = project_root / 'data' / 'samples' / 'complex_portfolio.xlsx'
+                if not file_path.exists() or file_path.is_dir():
+                    print(f"\n✗ Error: Path invalid: {file_path}")
+                    exit(1)
+                if file_path.suffix.lower() not in ['.csv','.xlsx','.xls']:
+                    confirm = input(f"Warning: extension {file_path.suffix} may be unsupported. Continue? (y/n): ").strip().lower()
+                    if confirm != 'y':
+                        print('Cancelled.')
+                        exit(0)
+                portfolio_json = process_file_upload(agent, file_path)
+            elif choice == '2':
+                portfolio_json = manual_data_entry(agent)
+            else:
+                print('Invalid choice. Please run again and select 1 or 2.')
+                exit(1)
+            display_results(portfolio_json, agent)
+        except KeyboardInterrupt:
+            print('\n\nOperation cancelled by user.')
+        except Exception as e:
+            print(f"\n✗ Error: {e}")
+            import traceback
+            traceback.print_exc()
