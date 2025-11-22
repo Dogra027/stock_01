@@ -1,24 +1,46 @@
-# file: agents/news.py
+# file: agents/news_agent.py
 """
-NewsAgent - compact JSON output (news_items only) with ticker + sector inference.
+NewsAgent (updated) — integrates industry extraction and returns RAG-ready JSON.
 
-Run: python agents/news.py
+Features:
+- Uses IngestAgent.process_portfolio() when --ingest-file is provided and IngestAgent is importable.
+- Extracts tickers, sectors, and industry values from holdings and includes them in relevance matching.
+- Fetches Google News RSS, optional NewsAPI, and curated Indian RSS feeds.
+- Normalizes, filters by time window, entity-links to tickers/company names/sectors/industries, dedupes, clusters.
+- Outputs canonical RAG JSON: { "news_items": [...], "clusters": [...] } (default).
+- Optional readable prints with --print-items / --print-clusters.
+- Optional --json-only to suppress any non-JSON stdout (prints only the canonical JSON).
+
+Usage examples:
+  python agents/news_agent.py --ingest-file data/my_portfolio.xlsx --strip-suffix --include-indian-rss --hours 24 --max 10 --out-json news_out.json
+  python agents/news_agent.py --tickers "TCS,RELIANCE,INFY" --hours 24 --max 8 --json-only
 """
 from __future__ import annotations
 
+import argparse
 import html
 import hashlib
 import json
 import re
+import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple, Iterable
 from urllib.parse import quote_plus
-from urllib.request import urlopen, Request
+from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
-from pathlib import Path
 
-# ---------- Data model ----------
+# Try to import your IngestAgent (optional)
+HAVE_INGEST_AGENT = False
+try:
+    from agents.ingest_agent import IngestAgent  # type: ignore
+    HAVE_INGEST_AGENT = True
+except Exception:
+    HAVE_INGEST_AGENT = False
+
+
+# ---------------------- Data class ----------------------
 @dataclass
 class NewsItem:
     id: str
@@ -26,42 +48,71 @@ class NewsItem:
     snippet: Optional[str]
     url: Optional[str]
     source: Optional[str]
-    published_at: Optional[str]  # iso string
+    published_at: Optional[datetime]
     text: Optional[str]
     tickers: List[str]
-    sectors: List[str]
+    sectors: List[str]  # includes sectors + industries
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if self.published_at:
+            d['published_at'] = self.published_at.isoformat()
+        return d
 
 
-# ---------- Agent ----------
+# ---------------------- NewsAgent ----------------------
 class NewsAgent:
-    def __init__(self):
-        # defaults tuned for simple runs
-        self.user_agent = "NewsAgent/1.0"
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
 
-    # ----- fetchers -----
+    # Generic RSS fetcher
     def _fetch_rss(self, url: str, source_name: str, max_items: int = 10) -> List[Dict[str, Any]]:
+        if self.verbose:
+            print(f"Fetching RSS: {source_name} -> {url}", file=sys.stderr)
         try:
-            req = Request(url, headers={"User-Agent": self.user_agent})
+            req = Request(url, headers={"User-Agent": "NewsAgent/1.0"})
             with urlopen(req, timeout=15) as resp:
                 raw = resp.read()
             root = ET.fromstring(raw)
             items = []
             for item in root.findall('.//item')[:max_items]:
-                title = item.findtext('title') or ''
-                link = item.findtext('link') or ''
-                desc = item.findtext('description') or item.findtext('summary') or ''
-                pub = item.findtext('pubDate') or item.findtext('published') or item.findtext('dc:date') or None
+                title = item.findtext('title')
+                link = item.findtext('link')
+                desc = item.findtext('description')
+                pub = item.findtext('pubDate') or item.findtext('published')
                 items.append({'title': title, 'link': link, 'description': desc, 'pubDate': pub, 'source': source_name})
             return items
-        except Exception:
+        except Exception as e:
+            if self.verbose:
+                print(f"Warning: RSS fetch failed for {source_name}: {e}", file=sys.stderr)
             return []
 
     def fetch_google_news_rss(self, query: str, max_items: int = 10) -> List[Dict[str, Any]]:
         url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
         return self._fetch_rss(url, 'google_news_rss', max_items=max_items)
+
+    def fetch_newsapi(self, query: str, api_key: Optional[str], max_items: int = 10) -> List[Dict[str, Any]]:
+        if not api_key:
+            return []
+        try:
+            url = f"https://newsapi.org/v2/everything?q={quote_plus(query)}&pageSize={max_items}&sortBy=publishedAt"
+            req = Request(url, headers={"User-Agent": "NewsAgent/1.0", "X-Api-Key": api_key})
+            with urlopen(req, timeout=10) as resp:
+                data = json.load(resp)
+            articles = []
+            for a in data.get('articles', [])[:max_items]:
+                articles.append({
+                    'title': a.get('title'),
+                    'link': a.get('url'),
+                    'description': a.get('description'),
+                    'pubDate': a.get('publishedAt'),
+                    'source': a.get('source', {}).get('name', 'newsapi')
+                })
+            return articles
+        except Exception as e:
+            if self.verbose:
+                print(f"Warning: NewsAPI fetch failed: {e}", file=sys.stderr)
+            return []
 
     def fetch_indian_rss_sources(self, max_items_per_feed: int = 8) -> List[Dict[str, Any]]:
         feeds = {
@@ -78,59 +129,54 @@ class NewsAgent:
             items += self._fetch_rss(url, name, max_items=max_items_per_feed)
         return items
 
-    # ----- normalization -----
-    def _strip_html(self, s: Optional[str]) -> Optional[str]:
+    # Normalization
+    def _strip_html_tags(self, s: str) -> str:
         if not s:
             return s
-        s = html.unescape(s)
-        s = re.sub(r'<[^>]+>', ' ', s)
-        s = re.sub(r'\s+', ' ', s).strip()
-        return s
+        return re.sub(r'<[^>]+>', ' ', s)
 
-    def _parse_pubdate(self, pub: Optional[str]) -> Optional[datetime]:
-        if not pub:
-            return None
-        try:
-            # iso if possible
-            return datetime.fromisoformat(pub.replace('Z', '+00:00'))
-        except Exception:
-            try:
-                from email.utils import parsedate_to_datetime
-                return parsedate_to_datetime(pub)
-            except Exception:
-                try:
-                    return datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %Z")
-                except Exception:
-                    return None
-
-    def normalize(self, raw: Dict[str, Any]) -> Dict[str, Any]:
-        title = (raw.get('title') or '').strip()
-        snippet = self._strip_html(raw.get('description') or '')
+    def normalize_raw(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        title = (raw.get('title') or '')
+        title = html.unescape(title).strip()
+        snippet = raw.get('description') or raw.get('snippet') or None
+        if snippet:
+            snippet = html.unescape(snippet).strip()
+            snippet = self._strip_html_tags(snippet)
+            snippet = re.sub(r'\s+', ' ', snippet).strip()
         url = raw.get('link') or raw.get('url') or None
         source = raw.get('source') or None
         pub = raw.get('pubDate') or raw.get('publishedAt') or None
-        dt = self._parse_pubdate(pub)
-        if isinstance(dt, datetime):
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+        published_at = None
+        if pub:
+            try:
+                published_at = datetime.fromisoformat(pub.replace('Z', '+00:00'))
+            except Exception:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    published_at = parsedate_to_datetime(pub)
+                except Exception:
+                    published_at = None
+        if isinstance(published_at, datetime):
+            if published_at.tzinfo is None:
+                published_at = published_at.replace(tzinfo=timezone.utc)
             else:
-                dt = dt.astimezone(timezone.utc)
-            published_iso = dt.isoformat()
-        else:
-            published_iso = None
-        text = ' '.join(filter(None, [title, snippet]))[:20000] if title or snippet else None
-        return {'headline': title, 'snippet': snippet, 'url': url, 'source': source, 'published_at': published_iso, 'text': text}
+                published_at = published_at.astimezone(timezone.utc)
 
-    # ----- dedupe -----
+        text = ' '.join(filter(None, [title, snippet]))
+        if text and len(text) > 20000:
+            text = text[:20000]
+        return {'headline': title, 'snippet': snippet, 'url': url, 'source': source, 'published_at': published_at, 'text': text}
+
+    # Deduplication
     def fingerprint(self, headline: str, url: Optional[str]) -> str:
         key = (headline or '').strip().lower() + '||' + (url or '')
         return hashlib.sha256(key.encode('utf-8')).hexdigest()
 
-    def dedupe(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def dedupe(self, normalized_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         seen = set()
         out = []
-        for it in items:
-            fp = self.fingerprint(it.get('headline',''), it.get('url'))
+        for it in normalized_items:
+            fp = self.fingerprint(it.get('headline', ''), it.get('url'))
             if fp in seen:
                 continue
             seen.add(fp)
@@ -138,235 +184,414 @@ class NewsAgent:
             out.append(it)
         return out
 
-    # ----- alias generator & entity linking -----
-    def _generate_aliases(self, tickers: List[str]) -> Dict[str, List[str]]:
-        out = {}
-        for tk in tickers:
-            if not tk:
-                continue
-            k = tk.strip().upper()
-            base = k.split('.')[0]
-            # heuristics: make spaced name variants
-            spaced = re.sub(r'[_\-.]+', ' ', base)
-            spaced = re.sub(r'(?<=[a-zA-Z])(?=[A-Z][a-z])', ' ', spaced)
-            spaced = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', spaced)
-            spaced = spaced.strip()
-            forms = set()
-            if spaced:
-                forms.add(spaced.upper())
-                forms.add(spaced.title())
-                forms.add(re.sub(r'\s+', '', spaced).upper())
-            tokens = re.split(r'\s+', spaced.upper()) if spaced else [base]
-            if tokens:
-                forms.add(tokens[0])
-            cleaned = [f for f in forms if len(re.sub(r'[^A-Za-z]', '', f)) >= 2 and not re.search(r'^\d+$', f)]
-            if cleaned:
-                out[k] = cleaned
-        return out
-
-    def link_entities(self, text: str, tickers: List[str], ticker_to_names: Dict[str, List[str]]) -> Tuple[List[str], List[str]]:
-        text_l = (text or '').lower()
-        found = set()
+    # Entity linking
+    def link_entities(self, item_text: str, tickers: Iterable[str], sectors: Iterable[str],
+                      ticker_to_names: Optional[Dict[str, Iterable[str]]] = None) -> Tuple[List[str], List[str]]:
+        """
+        Returns (tickers_found, sectors_and_industries_found)
+        `sectors` argument may include both sector and industry keywords.
+        """
+        text = (item_text or '') or ''
+        text_lower = text.lower()
+        found_tickers = set()
+        ticker_to_names = ticker_to_names or {}
         for t in tickers:
-            if not t:
+            t_clean = (t or '').strip().upper()
+            if not t_clean:
                 continue
-            t_up = t.strip().upper()
-            # direct ticker match ($ or bare)
-            if re.search(rf"(\${re.escape(t_up)}|\b{re.escape(t_up)}\b)", text, flags=re.IGNORECASE):
-                found.add(t_up)
-                continue
-            # match aliases
-            aliases = ticker_to_names.get(t_up, [])
-            for a in aliases:
-                a_norm = a.lower().strip()
-                if not a_norm:
-                    continue
-                # word boundary match or contiguous letters match
-                if a_norm in text_l or re.search(rf"\b{re.escape(a_norm)}\b", text_l, flags=re.IGNORECASE):
-                    found.add(t_up)
-                    break
-        # sectors handled separately
-        return sorted(found)
-
-    # ----- simple sector inference -----
-    def infer_sectors(self, tickers: List[str]) -> List[str]:
-        sectors = set()
-        for t in tickers:
-            tu = t.upper()
-            if 'BANK' in tu or tu.endswith('BANK') or tu.endswith('BANK.NS'):
-                sectors.add('financials')
-            elif 'PHARMA' in tu or 'DRUG' in tu or 'CHEM' in tu:
-                sectors.add('healthcare')
-            elif any(x in tu for x in ['INFY','TCS','WIPRO','HCL','TECH','IT']):
-                sectors.add('information_technology')
-            elif any(x in tu for x in ['RELIANCE','ONGC','OIL','POWER','ENERGY','PETRO']):
-                sectors.add('energy')
-            elif any(x in tu for x in ['TITAN','MOTORS','MARUTI','TATA','MAHINDRA','EICHER','BAJAJ']):
-                sectors.add('consumer_discretionary')
-            elif any(x in tu for x in ['ITC','HINDUNILVR','NESTLE','DABUR','BRITANNIA']):
-                sectors.add('consumer_staples')
-            elif any(x in tu for x in ['COAL','CEMENT','ULTRACEM','LARSEN']):
-                sectors.add('materials')
+            # match $TICKER or TICKER as whole word
+            if len(t_clean) <= 2:
+                if re.search(rf"\${re.escape(t_clean)}\b", text, flags=re.IGNORECASE):
+                    found_tickers.add(t_clean)
             else:
-                sectors.add('other')
-        return sorted(sectors)
+                if re.search(rf"\${re.escape(t_clean)}\b", text, flags=re.IGNORECASE) or re.search(
+                        rf"\b{re.escape(t_clean)}\b", text, flags=re.IGNORECASE):
+                    found_tickers.add(t_clean)
+            aliases = ticker_to_names.get(t_clean, [])
+            for alias in aliases:
+                if not alias:
+                    continue
+                if re.search(rf"\b{re.escape(alias.lower())}\b", text_lower, flags=re.IGNORECASE):
+                    found_tickers.add(t_clean)
 
-    # ----- run -----
-    def run(self, tickers: List[str], sectors_input: List[str], window_hours: int = 168, max_per_ticker: int = 10, include_indian_rss: bool = True, require_ticker_mention: bool = False, ticker_to_names: Optional[Dict[str, List[str]]] = None) -> Dict[str, Any]:
+        found_sectors = set()
+        for s in sectors:
+            s_clean = (s or '').strip().lower()
+            if not s_clean:
+                continue
+            if re.search(rf"\b{re.escape(s_clean)}\b", text_lower, flags=re.IGNORECASE):
+                found_sectors.add(s_clean)
+
+        return sorted(found_tickers), sorted(found_sectors)
+
+    # Relevance filtering
+    def is_relevant(self, headline: str, snippet: Optional[str], tickers: Iterable[str], sectors: Iterable[str],
+                    ticker_to_names: Optional[Dict[str, Iterable[str]]] = None) -> bool:
+        text = ' '.join(filter(None, [headline or '', snippet or '']))
+        t_found, s_found = self.link_entities(text, tickers, sectors, ticker_to_names=ticker_to_names)
+        if t_found or s_found:
+            return True
+        strong_keywords = [
+            'earnings', 'quarterly', 'revenue', 'guidance', 'profits', 'ipo', 'buyback', 'dividend',
+            'merger', 'acquisition', 'ceo', 'cfo', 'earnings call', 'analyst', 'rating', 'downgrade',
+            'upgrade', 'insider', 'trading halt', 'stock split', 'layoff', 'bankruptcy'
+        ]
+        txt = (text or '').lower()
+        for kw in strong_keywords:
+            if kw in txt:
+                return True
+        return False
+
+    # Clustering (token-set Jaccard)
+    def _token_set(self, s: str) -> set:
+        if not s:
+            return set()
+        toks = re.findall(r"[A-Za-z0-9$]{2,}", s.lower())
+        return set(toks)
+
+    def jaccard(self, a: str, b: str) -> float:
+        ta = self._token_set(a)
+        tb = self._token_set(b)
+        if not ta and not tb:
+            return 0.0
+        inter = ta.intersection(tb)
+        uni = ta.union(tb)
+        return len(inter) / len(uni)
+
+    def cluster_items(self, items: List[Dict[str, Any]], threshold: float = 0.35) -> List[Dict[str, Any]]:
+        n = len(items)
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for i in range(n):
+            ti = (items[i].get('headline', '') or '') + ' ' + (items[i].get('snippet') or '')
+            for j in range(i + 1, n):
+                tj = (items[j].get('headline', '') or '') + ' ' + (items[j].get('snippet') or '')
+                score = self.jaccard(ti, tj)
+                if score >= threshold:
+                    union(i, j)
+
+        clusters_map: Dict[int, List[int]] = {}
+        for idx in range(n):
+            root = find(idx)
+            clusters_map.setdefault(root, []).append(idx)
+
+        clusters = []
+        for k, idxs in clusters_map.items():
+            rep = None
+            rep_dt = None
+            for i in idxs:
+                dt = items[i].get('published_at')
+                if isinstance(dt, str):
+                    try:
+                        dt = datetime.fromisoformat(dt)
+                    except Exception:
+                        dt = None
+                if dt and (rep_dt is None or dt > rep_dt):
+                    rep_dt = dt
+                    rep = items[i]
+            if not rep:
+                rep = items[idxs[0]]
+            clusters.append({
+                'id': hashlib.sha1('|'.join([items[i]['id'] for i in idxs]).encode()).hexdigest(),
+                'representative_headline': rep.get('headline'),
+                'article_ids': [items[i]['id'] for i in idxs]
+            })
+        return clusters
+
+    # Run / public API
+    def run(self, tickers: List[str], sectors: List[str], window_hours: int = 24, max_per_ticker: int = 10,
+            newsapi_key: Optional[str] = None, ephemeral_index: bool = False, require_ticker_mention: bool = True,
+            ticker_to_names: Optional[Dict[str, Iterable[str]]] = None, include_indian_rss: bool = True) -> Dict[str, Any]:
+        """
+        tickers: list of tickers (e.g., ['RELIANCE','TCS'])
+        sectors: list of sector/industry keywords (lowercased preferred)
+        """
         window_cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
         raw_items: List[Dict[str, Any]] = []
-
-        queries = [t.upper() for t in tickers if t]
+        queries = list(set([t.upper() for t in tickers if t]))
         if not queries:
-            queries = [s for s in sectors_input if s]
+            queries = [s for s in sectors if s]
         if not queries:
             queries = ['market', 'stocks', 'industry']
 
         # fetch per query
         for q in queries:
             raw_items += self.fetch_google_news_rss(q, max_items=max_per_ticker)
+            raw_items += self.fetch_newsapi(q, newsapi_key, max_items=max_per_ticker)
 
+        # optionally add Indian RSS sources (curated)
         if include_indian_rss:
             raw_items += self.fetch_indian_rss_sources(max_items_per_feed=min(6, max_per_ticker))
 
         # normalize
-        normalized = [self.normalize(r) for r in raw_items]
+        normalized = [self.normalize_raw(r) for r in raw_items]
 
-        # time filter: keep if published within window or unknown (to maximize recall)
-        def within_window(it: Dict[str, Any]) -> bool:
-            pa = it.get('published_at')
-            if pa:
-                try:
-                    dt = datetime.fromisoformat(pa)
-                    return dt >= window_cutoff
-                except Exception:
-                    return True
-            return True
+        # filter by time window when possible
+        def within_window(it):
+            dt = it.get('published_at')
+            if isinstance(dt, datetime):
+                return dt >= window_cutoff
+            return False
 
         normalized = [n for n in normalized if within_window(n)]
+
+        # relevance filtering
+        filtered: List[Dict[str, Any]] = []
+        for n in normalized:
+            if self.is_relevant(n.get('headline'), n.get('snippet'), tickers, sectors, ticker_to_names=ticker_to_names):
+                filtered.append(n)
+        normalized = filtered
 
         # dedupe
         unique = self.dedupe(normalized)
 
-        # prepare alias map
-        alias_map = dict(ticker_to_names or {})
-        generated = self._generate_aliases(tickers)
-        for k, v in generated.items():
-            if k not in alias_map or not alias_map.get(k):
-                alias_map[k] = v
-
-        # entity linking + assemble output items
-        out_items: List[NewsItem] = []
+        # entity linking and assemble NewsItem objects
+        news_items: List[NewsItem] = []
         for u in unique:
-            text = u.get('text') or ''
-            matched_tickers = self.link_entities(text, tickers, alias_map)
-            # when strict require_ticker_mention is True, skip if no match
-            if require_ticker_mention and not matched_tickers:
+            published_at = u.get('published_at')
+            if isinstance(published_at, str):
+                try:
+                    published_at = datetime.fromisoformat(published_at)
+                except Exception:
+                    published_at = None
+            tid, sid = self.link_entities((u.get('text') or ''), tickers, sectors, ticker_to_names=ticker_to_names)
+            # If require_ticker_mention is True, skip items that don't mention at least one ticker
+            if require_ticker_mention and not tid:
                 continue
-            sectors_assigned = self.infer_sectors(matched_tickers) if matched_tickers else []
-            # build minimal item as per user requirement
+            # sid contains matched sectors and industries (lowercase)
             ni = NewsItem(
-                id = u.get('id'),
-                headline = u.get('headline') or '',
-                snippet = u.get('snippet') or '',
-                url = u.get('url'),
-                source = u.get('source'),
-                published_at = u.get('published_at'),
-                text = (u.get('text') or '')[:20000],
-                tickers = matched_tickers,
-                sectors = sectors_assigned
+                id=u['id'],
+                headline=u.get('headline'),
+                snippet=u.get('snippet'),
+                url=u.get('url'),
+                source=u.get('source'),
+                published_at=published_at,
+                text=u.get('text'),
+                tickers=tid,
+                sectors=sid
             )
-            out_items.append(ni)
+            news_items.append(ni)
 
-        # final output: only news_items list (compact)
-        return {'news_items': [n.to_dict() for n in out_items]}
+        items_dicts = [ni.to_dict() for ni in news_items]
+        clusters = self.cluster_items(items_dicts)
+
+        index = None
+        if ephemeral_index:
+            index = {ni.id: {'text': ni.text, 'fingerprint': hashlib.md5((ni.text or '').encode()).hexdigest()} for ni in news_items}
+
+        return {'news_items': items_dicts, 'clusters': clusters, 'ephemeral_index': index}
 
 
-# ---------- Helpers to load portfolio ----------
-def _load_tickers_from_portfolio_file(portfolio_path: Optional[str]) -> List[str]:
-    if not portfolio_path:
-        return []
-    try:
-        import importlib
-        pd = importlib.import_module("pandas")
-    except Exception:
-        return []
-    path = Path(portfolio_path).expanduser()
+# ---------------------- Runner helpers (with industry extraction) ----------------------
+def normalize_ticker(t: str, strip_suffix: bool = True) -> str:
+    t = (t or '').strip().upper()
+    if not t:
+        return ''
+    if strip_suffix:
+        t = re.sub(r'\.(NS|NSE|BSE|BO|L|SI|MI|NSI)$', '', t, flags=re.IGNORECASE)
+    return t
+
+
+def load_holdings_file(path: Path) -> List[Dict[str, Any]]:
+    # support JSON, CSV, Excel
     if not path.exists():
-        return []
+        raise FileNotFoundError(f"File not found: {path}")
+    suffix = path.suffix.lower()
+    if suffix == '.json':
+        data = json.loads(path.read_text(encoding='utf-8'))
+        return data if isinstance(data, list) else [data]
     try:
-        if path.suffix.lower() in {'.xlsx', '.xls'}:
-            df = pd.read_excel(path)
-        else:
-            df = pd.read_csv(path)
-    except Exception:
-        return []
-    ticker_col = None
-    for col in df.columns:
-        if isinstance(col, str) and col.strip().lower() in {'ticker', 'symbol'}:
-            ticker_col = col
-            break
-    tickers = []
-    if ticker_col:
-        tickers = df[ticker_col].dropna().astype(str).str.strip().tolist()
+        import pandas as pd
+    except Exception as e:
+        raise SystemExit("pandas required to read CSV/XLSX. Install it with `pip install pandas openpyxl`") from e
+    if suffix == '.csv':
+        df = pd.read_csv(path)
+    elif suffix in ('.xlsx', '.xls'):
+        df = pd.read_excel(path)
     else:
-        # fallback: take first column if it's a simple sample
+        raise ValueError("Unsupported file extension. Use .json, .csv, .xlsx, or .xls")
+    return df.to_dict(orient='records')
+
+
+def extract_tickers_sectors_industries_from_holdings(holdings: List[Dict[str, Any]], strip_suffix: bool = True) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
+    """
+    Extract tickers, combined sectors+industries keywords, and ticker->names mapping (aliases).
+    Returns:
+      tickers: List[str] (uppercased, suffix stripped if requested)
+      sectors_and_industries: List[str] (lowercased keywords used for matching)
+      ticker_to_names: dict mapping ticker -> [aliases...]
+    """
+    tickers = []
+    sectors_and_industries = []
+    ticker_to_names: Dict[str, List[str]] = {}
+    for row in holdings:
+        raw = row.get('ticker') or row.get('symbol') or ''
+        t = normalize_ticker(raw, strip_suffix=strip_suffix)
+        if t:
+            tickers.append(t)
+            aliases = ticker_to_names.setdefault(t, [])
+            # company/name aliases to improve matching
+            if row.get('company'):
+                aliases.append(row.get('company').lower())
+            if row.get('name'):
+                aliases.append(row.get('name').lower())
+            aliases.append(t.lower())
+            ticker_to_names[t] = sorted(set([a for a in aliases if a]))
+
+        # sector (prefer 'sector' then 'industry' then 'industry_group' etc.)
+        s = row.get('sector') or row.get('industry') or row.get('industry_group') or None
+        if s:
+            sectors_and_industries.append(str(s).lower())
+
+        # also check an explicit 'industry' field if separate
+        ind = row.get('industry') or None
+        if ind:
+            sectors_and_industries.append(str(ind).lower())
+
+    # dedupe lists
+    tickers = sorted(set(tickers))
+    sectors_and_industries = sorted(set([s for s in sectors_and_industries if s]))
+    return tickers, sectors_and_industries, ticker_to_names
+
+
+def load_holdings_from_url(url: str) -> List[Dict[str, Any]]:
+    req = Request(url, headers={'User-Agent': 'IngestClient/1.0'})
+    with urlopen(req, timeout=15) as resp:
+        data = json.load(resp)
+    return data if isinstance(data, list) else [data]
+
+
+# ---------------------- CLI ----------------------
+def cli():
+    p = argparse.ArgumentParser()
+    p.add_argument('--tickers', help='Comma separated tickers (overrides ingest-file/URL)')
+    p.add_argument('--ingest-file', help='Path to CSV/XLSX/JSON holdings file')
+    p.add_argument('--ingest-url', help='URL to fetch holdings JSON (HTTP GET)')
+    p.add_argument('--strip-suffix', action='store_true', help='Strip exchange suffixes like .NS')
+    p.add_argument('--include-indian-rss', action='store_true', help='Include curated Indian RSS feeds')
+    p.add_argument('--newsapi-key', help='NewsAPI.org key (optional)')
+    p.add_argument('--hours', type=int, default=24, help='Lookback window hours')
+    p.add_argument('--max', type=int, default=8, help='Max articles per ticker/query')
+    p.add_argument('--print-items', action='store_true', help='Print human-readable item details (in addition to JSON)')
+    p.add_argument('--print-clusters', action='store_true', help='Print human-readable cluster details (in addition to JSON)')
+    p.add_argument('--out-json', help='Write full output JSON to file')
+    p.add_argument('--verbose', action='store_true', help='Verbose fetch logs (goes to stderr)')
+    p.add_argument('--json-only', action='store_true', help='Print only the canonical JSON to stdout (suppress other prints)')
+    args = p.parse_args()
+
+    json_only = args.json_only
+
+    holdings: List[Dict[str, Any]] = []
+    tickers: List[str] = []
+    sectors_and_industries: List[str] = []
+    ticker_to_names: Dict[str, List[str]] = {}
+
+    # priority: tickers CLI > ingest-file > ingest-url
+    if args.tickers:
+        tickers = [normalize_ticker(t, strip_suffix=args.strip_suffix) for t in args.tickers.split(',') if t.strip()]
+    elif args.ingest_file:
+        path = Path(args.ingest_file).expanduser()
+        if not path.exists():
+            raise SystemExit(f"File not found: {path}")
+
+        # If IngestAgent is available and file is CSV/XLSX use it to parse canonical portfolio
+        if HAVE_INGEST_AGENT and path.suffix.lower() in ('.csv', '.xlsx', '.xls'):
+            try:
+                ingest = IngestAgent(retention_mode='persistent', user_id='user123', use_symbol_mapping=True, use_sector_mapping=True)
+                portfolio_json = ingest.process_portfolio(path)
+                holdings = portfolio_json.portfolio
+                tickers, sectors_and_industries, ticker_to_names = extract_tickers_sectors_industries_from_holdings(holdings, strip_suffix=args.strip_suffix)
+            except Exception as e:
+                # fallback to file read if ingest parsing fails
+                print(f"Warning: IngestAgent processing failed, falling back to raw file read: {e}", file=sys.stderr)
+                holdings = load_holdings_file(path)
+                tickers, sectors_and_industries, ticker_to_names = extract_tickers_sectors_industries_from_holdings(holdings, strip_suffix=args.strip_suffix)
+        else:
+            holdings = load_holdings_file(path)
+            tickers, sectors_and_industries, ticker_to_names = extract_tickers_sectors_industries_from_holdings(holdings, strip_suffix=args.strip_suffix)
+    elif args.ingest_url:
         try:
-            first_col = df.iloc[:,0].dropna().astype(str).str.strip().tolist()
-            tickers = first_col
-        except Exception:
-            tickers = []
-    normalized = []
-    seen = set()
-    for t in tickers:
-        k = t.strip().upper()
-        if k and k not in seen:
-            seen.add(k)
-            normalized.append(k)
-    return normalized
+            holdings = load_holdings_from_url(args.ingest_url)
+            tickers, sectors_and_industries, ticker_to_names = extract_tickers_sectors_industries_from_holdings(holdings, strip_suffix=args.strip_suffix)
+        except Exception as e:
+            raise SystemExit(f"Failed to load holdings from URL: {e}")
+    else:
+        p.print_help()
+        raise SystemExit("Provide --tickers or --ingest-file or --ingest-url")
 
-
-# ---------- CLI ----------
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--portfolio-file', help='Optional portfolio file path', default=None)
-    parser.add_argument('--hours', '-w', type=int, default=168)
-    parser.add_argument('--max', '-m', type=int, default=10)
-    parser.add_argument('--no-indian-rss', dest='include_indian_rss', action='store_false')
-    parser.set_defaults(include_indian_rss=True)
-    args = parser.parse_args()
-
-    # auto-discover portfolio file if not provided
-    portfolio_file = args.portfolio_file
-    if not portfolio_file:
-        project_root = Path(__file__).parent.parent
-        candidates = [
-            Path("/home/sahildogra/Desktop/ingest_agent/data/samples/large_portfolio.xlsx"),
-            Path("/mnt/data/large_portfolio.xlsx"),
-            project_root / "data" / "samples" / "large_portfolio.xlsx",
-            project_root / "data" / "samples" / "complex_portfolio.xlsx",
-        ]
-        for c in candidates:
-            if c.exists():
-                portfolio_file = str(c)
-                break
-
-    tickers = _load_tickers_from_portfolio_file(portfolio_file)
     if not tickers:
-        # fallback default tickers
-        tickers = ['RELIANCE.NS', 'TCS.NS']
+        raise SystemExit("No tickers found in inputs.")
 
-    agent = NewsAgent()
+    # Combine sectors and industries into one list used for matching (lowercased)
+    sectors_for_matching = [s.lower() for s in sectors_and_industries]
+
+    agent = NewsAgent(verbose=args.verbose)
     out = agent.run(
-        tickers = tickers,
-        sectors_input = [],
-        window_hours = args.hours,
-        max_per_ticker = args.max,
-        include_indian_rss = args.include_indian_rss,
-        require_ticker_mention = False
+        tickers=tickers,
+        sectors=sectors_for_matching,
+        window_hours=args.hours,
+        max_per_ticker=args.max,
+        newsapi_key=args.newsapi_key,
+        ephemeral_index=False,
+        require_ticker_mention=True,
+        ticker_to_names=ticker_to_names,
+        include_indian_rss=args.include_indian_rss
     )
 
-    # Print only the compact news_items JSON (user requested format)
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    rag_out = {'news_items': out['news_items'], 'clusters': out['clusters']}
 
+    # Output behaviour
+    # If json-only requested, print only the canonical JSON to stdout (good for pipelines)
+    if json_only:
+        print(json.dumps(rag_out, default=str, indent=2))
+    else:
+        # Default prints canonical JSON to stdout (user requested this earlier)
+        print(json.dumps(rag_out, default=str, indent=2))
+
+        # Optional readable prints go to stdout as well (only if flags set)
+        if args.print_items:
+            print("\n=== NEWS ITEMS (detailed) ===")
+            for item in out['news_items']:
+                print('ID:', item.get('id'))
+                print('Published:', item.get('published_at'))
+                print('Headline:', item.get('headline'))
+                print('Source:', item.get('source'))
+                print('URL:', item.get('url'))
+                print('Tickers:', item.get('tickers'))
+                print('Sectors:', item.get('sectors'))
+                snippet = item.get('snippet')
+                if snippet:
+                    print('Snippet:', (snippet[:300] + '...') if len(snippet) > 300 else snippet)
+                print('----')
+
+        if args.print_clusters:
+            print("\n=== CLUSTERS (detailed) ===")
+            for cl in out['clusters']:
+                print('Cluster ID:', cl.get('id'))
+                print('Representative Headline:', cl.get('representative_headline'))
+                print('Article IDs:', cl.get('article_ids'))
+                print('----')
+
+    if args.out_json:
+        try:
+            with open(args.out_json, 'w', encoding='utf-8') as f:
+                json.dump(rag_out, f, default=str, indent=2)
+            if not json_only:
+                print(f"Wrote full output to {args.out_json}")
+        except Exception as e:
+            print(f"Warning: could not write output JSON: {e}", file=sys.stderr)
+
+
+if __name__ == '__main__':
+    cli()
